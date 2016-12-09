@@ -87,7 +87,7 @@ namespace Microsoft.Extensions.DependencyInjection
         private static T GetServiceFromCollection<T>(IServiceCollection services)
         {
             return (T)services
-                .FirstOrDefault(d => d.ServiceType == typeof(T))
+                .LastOrDefault(d => d.ServiceType == typeof(T))
                 ?.ImplementationInstance;
         }
 
@@ -131,7 +131,7 @@ namespace Microsoft.Extensions.DependencyInjection
             //
             // Action Discovery
             //
-            // These are consumed only when creating action descriptors, then they can be de-allocated
+            // These are consumed only when creating action descriptors, then they can be deallocated
 
             services.TryAddEnumerable(
                 ServiceDescriptor.Transient<IApplicationModelProvider, DefaultApplicationModelProvider>());
