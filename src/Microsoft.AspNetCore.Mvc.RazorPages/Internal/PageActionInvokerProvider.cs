@@ -4,12 +4,18 @@
 using System;
 using System.Collections.Concurrent;
 using System.Collections.Generic;
+using System.Diagnostics;
 using System.Linq;
 using System.Reflection;
 using Microsoft.AspNetCore.Mvc.Abstractions;
 using Microsoft.AspNetCore.Mvc.Filters;
 using Microsoft.AspNetCore.Mvc.Infrastructure;
+using Microsoft.AspNetCore.Mvc.Internal;
+using Microsoft.AspNetCore.Mvc.ModelBinding;
 using Microsoft.AspNetCore.Mvc.RazorPages.Infrastructure;
+using Microsoft.AspNetCore.Mvc.ViewFeatures;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
 
 namespace Microsoft.AspNetCore.Mvc.RazorPages.Internal
 {
@@ -20,18 +26,39 @@ namespace Microsoft.AspNetCore.Mvc.RazorPages.Internal
         private readonly IPageFactoryProvider _pageFactoryProvider;
         private readonly IActionDescriptorCollectionProvider _collectionProvider;
         private readonly IFilterProvider[] _filterProviders;
+        private readonly IReadOnlyList<IValueProviderFactory> _valueProviderFactories;
+        private readonly IModelMetadataProvider _modelMetadataProvider;
+        private readonly ITempDataDictionaryFactory _tempDataFactory;
+        private readonly HtmlHelperOptions _htmlHelperOptions;
+        private readonly IPageHandlerMethodSelector _selector;
+        private readonly DiagnosticSource _diagnosticSource;
+        private readonly ILogger<PageActionInvoker> _logger;
         private volatile InnerCache _currentCache;
 
         public PageActionInvokerProvider(
             IPageLoader loader,
             IPageFactoryProvider pageFactoryProvider,
             IActionDescriptorCollectionProvider collectionProvider,
-            IEnumerable<IFilterProvider> filterProviders)
+            IEnumerable<IFilterProvider> filterProviders,
+            IEnumerable<IValueProviderFactory> valueProviderFactories,
+            IModelMetadataProvider modelMetadataProvider,
+            ITempDataDictionaryFactory tempDataFactory,
+            IOptions<HtmlHelperOptions> htmlHelperOptions,
+            IPageHandlerMethodSelector selector,
+            DiagnosticSource diagnosticSource,
+            ILoggerFactory loggerFactory)
         {
             _loader = loader;
             _collectionProvider = collectionProvider;
             _pageFactoryProvider = pageFactoryProvider;
             _filterProviders = filterProviders.ToArray();
+            _valueProviderFactories = valueProviderFactories.ToArray();
+            _modelMetadataProvider = modelMetadataProvider;
+            _tempDataFactory = tempDataFactory;
+            _htmlHelperOptions = htmlHelperOptions.Value;
+            _selector = selector;
+            _diagnosticSource = diagnosticSource;
+            _logger = loggerFactory.CreateLogger<PageActionInvoker>();
         }
 
         public int Order { get; } = -1000;
@@ -43,14 +70,33 @@ namespace Microsoft.AspNetCore.Mvc.RazorPages.Internal
                 throw new ArgumentNullException(nameof(context));
             }
 
-            var actionDescriptor = context.ActionContext.ActionDescriptor as PageActionDescriptor;
+            var actionContext = context.ActionContext;
+            var actionDescriptor = actionContext.ActionDescriptor as PageActionDescriptor;
             if (actionDescriptor == null)
             {
                 return;
             }
 
-            var cacheEntry = GetOrAddCacheEntry(context, actionDescriptor);
-            context.Result = new PageActionInvoker(cacheEntry, context.ActionContext);
+            var cache = CurrentCache;
+            PageActionInvokerCacheEntry cacheEntry;
+
+            IFilterMetadata[] filters;
+            if (!cache.Entries.TryGetValue(actionDescriptor, out cacheEntry))
+            {
+                var filterFactoryResult = FilterFactory.GetAllFilters(_filterProviders, actionContext);
+                filters = filterFactoryResult.Filters;
+                cacheEntry = CreateCacheEntry(context, filterFactoryResult.CacheableFilters);
+                cacheEntry = cache.Entries.GetOrAdd(actionDescriptor, cacheEntry);
+            }
+            else
+            {
+                filters = FilterFactory.CreateUncachedFilters(
+                    _filterProviders,
+                    actionContext,
+                    cacheEntry.CacheableFilters);
+            }
+
+            context.Result = CreateActionInvoker(actionContext, cacheEntry, filters);
         }
 
         public void OnProvidersExecuted(ActionInvokerProviderContext context)
@@ -75,24 +121,31 @@ namespace Microsoft.AspNetCore.Mvc.RazorPages.Internal
             }
         }
 
-        // Internal for unit testing
-        internal PageActionInvokerCacheEntry GetOrAddCacheEntry(
-            ActionInvokerProviderContext context,
-            PageActionDescriptor actionDescriptor)
+        private PageActionInvoker CreateActionInvoker(
+            ActionContext actionContext,
+            PageActionInvokerCacheEntry cacheEntry,
+            IFilterMetadata[] filters)
         {
-            var cache = CurrentCache;
+            var tempData = _tempDataFactory.GetTempData(actionContext.HttpContext);
+            var pageContext = new PageContext(
+                actionContext,
+                new ViewDataDictionary(_modelMetadataProvider, actionContext.ModelState),
+                tempData,
+                _htmlHelperOptions);
 
-            PageActionInvokerCacheEntry cacheEntry;
-            if (!cache.Entries.TryGetValue(actionDescriptor, out cacheEntry))
-            {
-                cacheEntry = CreateCacheEntry(context);
-                cacheEntry = cache.Entries.GetOrAdd(actionDescriptor, cacheEntry);
-            }
-
-            return cacheEntry;
+            return new PageActionInvoker(
+                _selector,
+                _diagnosticSource,
+                _logger,
+                pageContext,
+                filters,
+                new CopyOnWriteList<IValueProviderFactory>(_valueProviderFactories),
+                cacheEntry);
         }
 
-        private PageActionInvokerCacheEntry CreateCacheEntry(ActionInvokerProviderContext context)
+        private PageActionInvokerCacheEntry CreateCacheEntry(
+            ActionInvokerProviderContext context,
+            FilterItem[] cachedFilters)
         {
             var actionDescriptor = (PageActionDescriptor)context.ActionContext.ActionDescriptor;
             var compiledType = _loader.Load(actionDescriptor).GetTypeInfo();
@@ -108,7 +161,9 @@ namespace Microsoft.AspNetCore.Mvc.RazorPages.Internal
                 compiledActionDescriptor,
                 _pageFactoryProvider.CreatePageFactory(compiledActionDescriptor),
                 _pageFactoryProvider.CreatePageDisposer(compiledActionDescriptor),
-                PageFilterFactoryProvider.GetFilterFactory(_filterProviders, context));
+                c => { throw new NotImplementedException(); },
+                (_, __) => { throw new NotImplementedException(); },
+                cachedFilters);
         }
 
         private class InnerCache
